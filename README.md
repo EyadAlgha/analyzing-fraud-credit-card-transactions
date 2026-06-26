@@ -15,6 +15,10 @@ The two-stage design is:
 1. **Supervised classification** with XGBoost to separate fraud from legitimate transactions.
 2. **Unsupervised clustering** with K-Means over risk-related features to assign a low / medium / high risk label to the flagged frauds.
 
+![Two-stage fraud detection architecture](assets/fraud_architecture.jpg)
+
+*An offline stage (`train.py`) engineers features and trains the fraud classifier and risk-segmentation model, saving them as one bundle; the online stage (`api.py`) loads that bundle and scores live transactions, sorting flagged frauds into low / medium / high risk and emitting a decision. See [Online inference](#online-inference).*
+
 ## Dataset
 
 [Credit Card Transactions Fraud Detection Dataset](https://www.kaggle.com/datasets/kartik2112/fraud-detection) by kartik2112 (Kaggle), pulled at runtime via `kagglehub`.
@@ -41,6 +45,7 @@ The two-stage design is:
 - `amt`, `city_pop`, `age` -> log transform
 - All numerical features then normalized to the [0, 1] range
 - Train/test split: 70/30, stratified on the fraud label
+- The split happens first; all encoders and the scaler are fit on the training split only (and the frequency counts use training data only) so no test information leaks into the features
 
 ### Classifier (XGBoost)
 
@@ -91,10 +96,22 @@ The expectation, supported by the analysis, is that low-risk and high-risk group
 ## Repository contents
 
 ```
-fraud_detection_final.ipynb     Full pipeline: EDA, modeling, clustering, validation
-ML_Final_Presentation.pptx      Final presentation slides
+experimentation.ipynb   Analysis notebook: EDA, modeling, clustering, validation
+config.py               Seed, feature lists, hyperparameters, decision map
+data.py                 Dataset download + loading
+preprocessing.py        Feature engineering, encoding (fit/transform split), merchant_risk, oversampling
+modeling.py             XGBoost build / train / tune / thresholded prediction
+clustering.py           K-Means risk clustering and low/medium/high labeling
+pipeline.py             run_pipeline() end-to-end orchestrator (offline analysis)
+tune.py                 Randomized hyperparameter search (base vs tuned report)
+train.py                Fit all artifacts and save the model bundle (online stage)
+inference.py            FraudModel bundle + score() raw transactions
+api.py                  FastAPI service exposing /predict
 README.md
 ```
+
+The notebook keeps only the analysis (EDA, plots, statistical validation); the
+pipeline plumbing lives in the modules above and is imported into the notebook.
 
 ## Running it
 
@@ -103,13 +120,61 @@ The notebook is built for an environment with internet access (it downloads the 
 ```bash
 pip install kaggle kagglehub folium feature_engine xgboost \
             scikit-learn imbalanced-learn shap scipy statsmodels \
-            pandas numpy matplotlib seaborn
+            pandas numpy matplotlib seaborn \
+            joblib fastapi uvicorn
 ```
 
 Then run the notebook top to bottom:
 
 ```bash
-jupyter notebook fraud_detection_final.ipynb
+jupyter notebook experimentation.ipynb
 ```
 
-A global seed (18) is set for reproducibility. Note that t-SNE and SHAP are the slowest steps.
+Or run the whole pipeline outside the notebook (no plots) via the orchestrator:
+
+```bash
+python pipeline.py
+```
+
+To search for better, less-overconfident hyperparameters (regularized XGBoost), compare base vs
+tuned on the test set, and print the best params to copy into `XGB_PARAMS`:
+
+```bash
+python tune.py
+```
+
+The search is the slow step; it runs on a `search_frac` of the training data (default 0.25) and
+refits the best configuration on the full set. Tune `n_iter` / `search_frac` in `run_tuning()` to
+trade runtime for thoroughness.
+
+A global seed (18) is set for reproducibility (`config.set_seed()`). Note that t-SNE and SHAP are the slowest steps.
+
+## Online inference
+
+The two-stage model is also served for real-time scoring. Train once to fit and persist every
+artifact (encoders, scaler, `merchant_risk`, classifier, KMeans, risk map) as a single bundle:
+
+```bash
+python train.py        # writes artifacts/fraud_model.joblib
+```
+
+Then serve it with FastAPI:
+
+```bash
+uvicorn api:app --reload
+```
+
+`POST /predict` takes one raw transaction and returns the fraud flag, probability, risk level, and
+the decision-engine action (`approve` / `monitor` / `review` / `decline`):
+
+```bash
+curl -X POST localhost:8000/predict -H 'Content-Type: application/json' -d '{
+  "merchant": "Kirlin and Sons", "category": "grocery_pos", "amt": 240.5,
+  "gender": "M", "city_pop": 120000, "job": "Surveyor",
+  "dob": "1980-01-15", "trans_date_trans_time": "2020-06-21 02:14:25"}'
+# -> {"is_fraud": 1, "fraud_proba": 0.88, "risk_level": "high-risk", "decision": "decline"}
+```
+
+Internally a request flows through the same two stages as the notebook: the XGBoost classifier at
+threshold `T`, then (for flagged frauds) the KMeans risk clusterer, then the `DECISION_MAP` in
+`config.py`. The interactive API docs are at `localhost:8000/docs`.
